@@ -20,92 +20,120 @@ dag = DAG(
     schedule_interval='@daily',
 )
 
-db_path = '/mnt/c/Users/pn002/Desktop/koulu/Golnaz/airflow/databases/weather_history_database.db'
-csv_folder_path = '/mnt/c/Users/pn002/Desktop/koulu/Golnaz/airflow/datasets/'
-csv_file_path = '/mnt/c/Users/pn002/Desktop/koulu/Golnaz/airflow/datasets/weatherHistory.csv'
+file_directory = '/Users/rimjim/airflow/datasets/'
+db_path = '/Users/rimjim/airflow/databases/weatherHistory_data.db'
+csv_file_path = '/Users/rimjim/airflow/datasets/weatherHistory.csv'
 
+#TAsk 1 : Extract Data
 
 def extract_data(**kwargs):
+    #Authenticate and download the 'Weather Dataset'
+    kaggle.api.authenticate()
+    kaggle.api.dataset_download_files("muthuj7/weather-dataset", file_directory)
 
     # # Check if the downloaded file is a ZIP file
-    # if zipfile.is_zipfile(zip_file_path):
-    #     # If it's a ZIP file, unzip it
-    #     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-    #         zip_ref.extractall(csv_folder_path)
-    #     # Update file path to extracted CSV
-    #     os.remove(zip_file_path)  # Optionally delete the ZIP file after extraction
-    # else:
-    #     print("Downloaded file is not a ZIP archive, skipping extraction.")
-    kwargs['ti'].xcom_push(key='weather_data', value=csv_file_path)
+    zip_path = file_directory + 'weather-dataset.zip'
+    if zipfile.is_zipfile(zip_path):
+        with zipfile.ZipFile(zip_path) as Zip:
+            Zip.extractall(file_directory)
+    else: 
+        raise ValueError('Downloaded file is not a zip file. Aborting extraction.')
+
+    # Xcom to pass file path to next step in pipeline
+    kwargs['ti'].xcom_push(key='file_path', value=file_path)
 
 extract_task = PythonOperator(
-    task_id='extract_task',
+    task_id='extract_data',
     python_callable=extract_data,
     provide_context=True,
     dag=dag,
 )
 
 def transform_data(**kwargs):
-    file_path = kwargs['ti'].xcom_pull(key='weather_data')
-    df = pd.read_csv(file_path)
+    csv_path = kwargs['ti'].xcom_pull(key='file_path')
+    df = pd.read_csv(csv_path)
 
     # Convert 'Formatted Date' to datetime
     df['Formatted Date'] = pd.to_datetime(df['Formatted Date'], errors='coerce', utc=True)
-
+    df.drop_duplicates(inplace= True)
+    
     # Handle missing values in critical columns
     critical_columns = ['Temperature (C)', 'Humidity', 'Wind Speed (km/h)', 'Visibility (km)', 'Pressure (millibars)']
     df[critical_columns].fillna(df[critical_columns].median(), inplace=True)
 
-    # Drop duplicates
-    df.drop_duplicates(inplace=True)
-
+    # Extract month from 'Formatted Date'
+    df['date'] = df['Formatted Date'].dt.date
+    df['month'] = df['Formatted Date'].dt.month
+    
     # Calculate daily averages for critical features
-    df['date'] = df['Formatted Date'].dt.date  # This should now work
-    daily_avg = df.groupby('date').agg({
+    daily_agg = df.groupby('date').agg({
         'Temperature (C)': 'mean',
         'Humidity': 'mean',
         'Wind Speed (km/h)': 'mean',
-        'Visibility (km)': 'mean',
-        'Pressure (millibars)': 'mean'
     }).reset_index()
-
-    # Extract month from 'Formatted Date'
-    df['month'] = df['Formatted Date'].dt.month
 
     # Calculate monthly mode for 'Precip Type', if there's no mode, set to NA
     monthly_mode = df.groupby('month')['Precip Type'].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else pd.NA).reset_index()
     monthly_mode.columns = ['month', 'Mode']
 
     # Add wind_strength column categorizing wind speed
-    df['wind_strength'] = pd.cut(
-        df['Wind Speed (km/h)'] / 3.6, 
-        bins=[-1, 1.5, 3.3, 5.4, 7.9, 10.7, 13.8, 17.1, 20.7, 24.4, 28.4, 32.6, float('inf')], 
-        labels=[
-            'Calm', 'Light Air', 'Light Breeze', 'Gentle Breeze', 'Moderate Breeze', 
-            'Fresh Breeze', 'Strong Breeze', 'Near Gale', 'Gale', 'Strong Gale', 
-            'Storm', 'Violent Storm'
-        ]
+    def wind_strength(speed):
+        if speed <= 1.5:
+            return 'Calm'
+         elif speed <= 3.3:
+            return 'Light Air'
+         elif speed <= 5.4:
+            return 'Light Breeze'
+         elif speed <= 7.9:
+            return 'Gentle Breeze'
+         elif speed <= 10.7:
+            return 'Moderate Breeze'
+         elif speed <= 13.8:
+            return 'Fresh Breeze'
+         elif speed <= 17.1:
+            return 'Strong Breeze'
+         elif speed <= 20.7:
+            return 'Near Gale'
+         elif speed <= 24.4:
+            return 'Gale'
+         elif speed <=28.4:
+            return 'Strong Gale'
+         elif speed <= 32.6:
+            return 'Storm'
+        else:
+            return 'Violent Storm'
+
+    #Apply eind strength categorization to the dataset
+    df['wind_strength'] = df['Wind Speed (km/h)'].apply(wind_strength)
+    # Merge wind strength with the daily aggregates
+    daily_agg = daily_agg.merges(
+        df[['date', 'Formatted Dete', 'wind_strength']].drop_duplicates(),
+        on='date',
+        how='left'
     )
 
     # Calculate monthly averages for critical features
-    monthly_avg = df.groupby('month').agg({
+    monthly_agg = df.groupby('month').agg({
         'Temperature (C)': 'mean',
         'Humidity': 'mean',
         'Wind Speed (km/h)': 'mean',
         'Visibility (km)': 'mean',
         'Pressure (millibars)': 'mean'
+        'Precip Type': lambda x: x.mode()[0] if not x.mode().empty else None
     }).reset_index()
 
     # Save daily and monthly transformed data to new CSV files
-    daily_avg.to_csv(csv_folder_path + 'daily_avg.csv', index=False)
-    monthly_avg.to_csv(csv_folder_path + 'monthly_avg.csv', index=False)
+    daily_path = '/Users/rimjim/airflow/tmp/daily_transformed.csv'
+    monthly_path = '/Users/rimjim/airflow/tmp/monthly_transformed.csv'
+    daily_agg.to_csv(cdaily_path, index=False)
+    monthly_agg.to_csv(monthly_path, index=False)
 
     # Push the file paths to XCom
-    kwargs['ti'].xcom_push(key='daily_avg_path', value=csv_folder_path + 'daily_avg.csv')
-    kwargs['ti'].xcom_push(key='monthly_avg_path', value=csv_folder_path + 'monthly_avg.csv')
+    kwargs['ti'].xcom_push(key='daily_path', value=daily_path)
+    kwargs['ti'].xcom_push(key='monthly_path', value=monthly_path)
 
 transform_task = PythonOperator(
-    task_id='transform_task',
+    task_id='transform_data',
     python_callable=transform_data,
     provide_context=True,
     dag=dag,
@@ -113,8 +141,8 @@ transform_task = PythonOperator(
 
 def validate_data(**kwargs):
     # Load the transformed data paths from XCom
-    daily_path = kwargs['ti'].xcom_pull(key='daily_avg_path')
-    monthly_path = kwargs['ti'].xcom_pull(key='monthly_avg_path')
+    daily_path = kwargs['ti'].xcom_pull(key='daily_path', task_ids='transform_data')
+    monthly_path = kwargs['ti'].xcom_pull(key='monthly_path',  task_ids='transform_data)
 
     df_daily = pd.read_csv(daily_path)
     df_monthly = pd.read_csv(monthly_path)
@@ -124,124 +152,137 @@ def validate_data(**kwargs):
     humidity_range = (0, 1)  # Humidity as a proportion (0 to 1)
     wind_speed_min = 0  # Wind speed should be >= 0
 
-    validation_issues = []
-
     # --- Validate Daily Data ---
     # Missing values check
-    if df_daily.isnull().any().any():
-        validation_issues.append("Daily data contains missing values.")
+    print('DATA: '+ str(daily_df))
+    if daily_df.isnull().any().any():
+        raise ValueErroe("Daily data contains missing values.")
 
     # Range checks for daily data
-    if not df_daily['Temperature (C)'].between(*temperature_range).all():
-        validation_issues.append("Daily Temperature values are out of range.")
-    if not df_daily['Humidity'].between(*humidity_range).all():
-        validation_issues.append("Daily Humidity values are out of range.")
-    if not (df_daily['Wind Speed (km/h)'] >= wind_speed_min).all():
-        validation_issues.append("Daily Wind Speed values are out of range.")
+    if not daily_df['Temperature (C)'].between(*temperature_range).all():
+         raise ValueErroe("Daily Temperature values are out of range.")
+    if not daily_df['Humidity'].between(*humidity_range).all():
+         raise ValueErroe("Daily Humidity values are out of range.")
+    if not (daily_df['Wind Speed (km/h)'] >= wind_speed_min).all():
+         raise ValueErroe("Daily Wind Speed values are out of range.")
 
     # --- Validate Monthly Data ---
     # Missing values check
-    if df_monthly.isnull().any().any():
-        validation_issues.append("Monthly data contains missing values.")
+    if monthly_df.isnull().any().any():
+         raise ValueErroe"Monthly data contains missing values.")
 
     # Range checks for monthly data
-    if not df_monthly['Temperature (C)'].between(*temperature_range).all():
-        validation_issues.append("Monthly Temperature values are out of range.")
-    if not df_monthly['Humidity'].between(*humidity_range).all():
-        validation_issues.append("Monthly Humidity values are out of range.")
-    if not (df_monthly['Wind Speed (km/h)'] >= wind_speed_min).all():
-        validation_issues.append("Monthly Wind Speed values are out of range.")
+    if not monthly_df['Temperature (C)'].between(*temperature_range).all():
+         raise ValueErroe("Monthly Temperature values are out of range.")
+    if not monthly_df['Humidity'].between(*humidity_range).all():
+         raise ValueErroe("Monthly Humidity values are out of range.")
+    if not (monthly_df['Wind Speed (km/h)'] >= wind_speed_min).all():
+         raise ValueErroe("Monthly Wind Speed values are out of range.")
 
     # --- Outlier Detection ---
     # Define outlier thresholds for temperature (adjust as needed for context)
     temp_outlier_thresholds = (-30, 40)  # Seasonal reasonable limits
-    daily_temp_outliers = df_daily[~df_daily['Temperature (C)'].between(*temp_outlier_thresholds)]
+    daily_temp_outliers = daily_df[~daily_df['Temperature (C)'].between(*temp_outlier_thresholds)]
     if not daily_temp_outliers.empty:
-        validation_issues.append(f"Daily Temperature outliers detected: {daily_temp_outliers['Temperature (C)'].values}")
+         raise ValueErroe(f"Daily Temperature outliers detected: {daily_temp_outliers['Temperature (C)'].values}")
 
-    monthly_temp_outliers = df_monthly[~df_monthly['Temperature (C)'].between(*temp_outlier_thresholds)]
+    monthly_temp_outliers = monthly_df[~monthly_df['Temperature (C)'].between(*temp_outlier_thresholds)]
     if not monthly_temp_outliers.empty:
-        validation_issues.append(f"Monthly Temperature outliers detected: {monthly_temp_outliers['Temperature (C)'].values}")
-
-    # --- Validation Results ---
-    if validation_issues:
-        for issue in validation_issues:
-            print(issue)
-        raise ValueError("Validation failed. See issues above.")
+         raise ValueErroe(f"Monthly Temperature outliers detected: {monthly_temp_outliers['Temperature (C)'].values}")
 
     print("Validation passed: All checks succeeded for daily and monthly data.")
 
 # Task definition for validation
 validate_task = PythonOperator(
-    task_id='validate_task',
+    task_id='validate_data',
     python_callable=validate_data,
     provide_context=True,
     dag=dag,
 )
 
 def load_data(**kwargs):
+    # Retrieve transformed file paths from XCom
+    daily_path = kwargs['ti'].xcom_pull(key='daily_path', task_ids='transdorm_data')
+    monthly_path = kwargs['ti'].xcom_pull(key='monthly_path', task_ids='transdorm_data')
+
+    # Load the data from the Csv files
+    daily_df = pd.read_csv(daily_path)
+    monthly_df = pd.read_csv(monthly_df)
+
+    # Rename the dataframe to match the SQL table properties
+    daily_df = daily_df.drop(columns=['date'])
+    daily_df = daily_df.rename(
+        colums={
+            'Temperature (C) : 'temperature_c',
+            'Formatted Date' : 'formatted_date',
+            'Humidity' : 'humidity',
+            'Wind Speed (km/h)' : 'wind_speed_kmh'
+        }
+    )
+
+    monthly_df = monthly_df.drop(columns=['Wind Speed (km/h)'])
+    daily_df = daily_df.rename(
+        colums={
+            'Temperature (C) : 'avg_temperature_c',
+            'Formatted Date' : 'formatted_date',
+            'Humidity' : 'avg_humidity',
+            'Visibility (km)' : 'avg_visibilty_km',
+            'Pressure (millibars)' : 'avg_pressure_millibars',
+            'Precip Type' : 'mode_precip_type'
+        }
+    )
+
     # Connect to SQLite database
     conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-    # Retrieve transformed file paths from XCom
-    transformed_daily = kwargs['ti'].xcom_pull(key='daily_avg_path')
-    transformed_monthly = kwargs['ti'].xcom_pull(key='monthly_avg_path')
+    # Create daily_weather table if it doesn't exist
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_weather (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            formatted_date TEXT,
+            temperature_c REAL,
+            apparent_temperature_c REAL,
+            humidity REAL,
+            wind_speed_kmh REAL,
+            visibility_km REAL,
+            pressure_millibars REAL,
+            wind_strength TEXT,
+            avg_temperature_c REAL,
+            avg_humidity REAL,
+            avg_wind_speed_kmh REAL
+        )
+     ''')
 
-    # cursor = conn.cursor()
-
-    # # Create daily_weather table if it doesn't exist
-    # ## This step is not needed as the table is created in the next step when the data is loaded
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS daily_weather (
-    #         id INTEGER PRIMARY KEY AUTOINCREMENT,
-    #         formatted_date TEXT,
-    #         temperature_c REAL,
-    #         apparent_temperature_c REAL,
-    #         humidity REAL,
-    #         wind_speed_kmh REAL,
-    #         visibility_km REAL,
-    #         pressure_millibars REAL,
-    #         wind_strength TEXT,
-    #         avg_temperature_c REAL,
-    #         avg_humidity REAL,
-    #         avg_wind_speed_kmh REAL
-    #     )
-    # ''')
-
-    # # Create monthly_weather table if it doesn't exist
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS monthly_weather (
-    #         id INTEGER PRIMARY KEY AUTOINCREMENT,
-    #         month INTEGER,
-    #         avg_temperature_c REAL,
-    #         avg_apparent_temperature_c REAL,
-    #         avg_humidity REAL,
-    #         avg_visibility_km REAL,
-    #         avg_pressure_millibars REAL,
-    #         mode_precip_type TEXT
-    #     )
-    # ''')
-
-    # conn.cursor()
+    # Create monthly_weather table if it doesn't exist
+    cursor.execute('''
+         CREATE TABLE IF NOT EXISTS monthly_weather (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             month INTEGER,
+             avg_temperature_c REAL,
+             avg_apparent_temperature_c REAL,
+             avg_humidity REAL,
+             avg_visibility_km REAL,
+             avg_pressure_millibars REAL,
+             mode_precip_type TEXT
+         )
+     ''')
 
 
-    # Load daily data
-    df_daily = pd.read_csv(transformed_daily)
-    df_daily.to_sql('daily_weather', conn, if_exists='replace', index=False)
+    # Insert the data into the respective tables
+    daily_df.to_sql('daily_weather', conn, if_exists='append', index=False)
+    monthly_df.to_sql('monthly_weather', conn, if_exists='append', index=False)
 
-    # Load monthly data
-    df_monthly = pd.read_csv(transformed_monthly)
-    df_monthly.to_sql('monthly_weather', conn, if_exists='replace', index=False)
-
-    conn.commit()
     conn.close()
 
 load_task = PythonOperator(
-    task_id='load_task',
+    task_id='load_data',
     python_callable=load_data,
     provide_context=True,
+    trigger_rule = 'all_success',
     dag=dag,
 )
 
 # Set task dependencies
-extract_task >> transform_task >> validate_task >> load_task
+extract_task >> transform_data >> validate_data >> load_data
